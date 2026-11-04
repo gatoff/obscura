@@ -8993,9 +8993,60 @@ mod tests {
             return [support, borrowed.call(child, 'copy'), document.execCommand('copy'),
                 document.querySelector('p').textContent];
         })()"#).unwrap(), serde_json::json!([
-            [[false, false, false, false, false], [false, false, false, false, false],
-                [false, false, false, false, false]], false, false, "unchanged"
+            // copy, cut and paste are implemented (keyboard shortcuts), so they are
+            // advertised; formatting and unknown commands still are not.
+            [[true, true, true, false, false], [true, true, true, false, false],
+                [true, true, true, false, false]], true, false, "unchanged"
         ]));
+    }
+
+    #[test]
+    fn exec_command_insert_text_edits_a_contenteditable_like_blink() {
+        let mut rt = setup_runtime("<body><div id=e contenteditable=true><p><br></p></div></body>");
+        // Each case starts from LinkedIn's empty composer, <p><br></p>.
+        assert_eq!(rt.evaluate(r#"(() => {
+            const e = document.getElementById('e');
+            const write = text => {
+                e.innerHTML = '<p><br></p>';
+                getSelection().removeAllRanges();
+                e.focus();
+                const events = [];
+                const log = ev => events.push(ev.type + ':' + ev.inputType);
+                e.addEventListener('beforeinput', log); e.addEventListener('input', log);
+                const ok = document.execCommand('insertText', false, text);
+                e.removeEventListener('beforeinput', log); e.removeEventListener('input', log);
+                return [ok, e.innerHTML, events.join(',')];
+            };
+            return [write('hello'), write('line \nnext'), write('a\n\nb'), write('A  B'),
+                    write('A\n  B'), document.queryCommandSupported('insertText')];
+        })()"#).unwrap(), serde_json::json!([
+            [true, "<p>hello</p>", "input:insertText"],
+            [true, "<p>line&nbsp;</p><p>next</p>", "input:insertText"],
+            [true, "<p>a</p><p><br></p><p>b</p>", "input:insertText"],
+            [true, "<p>A&nbsp;&nbsp;B</p>", "input:insertText"],
+            [true, "<p>A</p><p>&nbsp; B</p>", "input:insertText"],
+            true
+        ]));
+    }
+
+    #[test]
+    fn exec_command_without_an_editable_selection_does_nothing() {
+        let mut rt = setup_runtime("<body><p id=p>static</p></body>");
+        assert_eq!(rt.evaluate(r#"(() => [document.execCommand('insertText', false, 'x'),
+            document.getElementById('p').innerHTML])()"#).unwrap(),
+            serde_json::json!([false, "static"]));
+    }
+
+    #[test]
+    fn focusing_an_editing_host_places_the_caret_and_reflects_editability() {
+        let mut rt = setup_runtime("<body><div id=e contenteditable><p><br></p></div><span id=s>x</span></body>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const e = document.getElementById('e');
+            e.focus();
+            const r = getSelection().getRangeAt(0);
+            return [getSelection().rangeCount, r.startContainer.nodeName, e.isContentEditable,
+                    e.contentEditable, document.getElementById('s').isContentEditable];
+        })()"#).unwrap(), serde_json::json!([1, "P", true, "true", false]));
     }
 
     #[test]
@@ -9024,6 +9075,17 @@ mod tests {
                     typeof Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent').get,
                     typeof before, navigator.platform];
         })()"#).unwrap(), serde_json::json!([0, true, "[object Navigator]", "function", "string", "MacIntel"]));
+    }
+
+    #[test]
+    fn data_transfer_and_clipboard_event_carry_their_data() {
+        let mut rt = setup_runtime("<body></body>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const dt = new DataTransfer();
+            dt.setData('text', 'hello');
+            const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true });
+            return [dt.types, ev.clipboardData.getData('text/plain'), dt.items.length];
+        })()"#).unwrap(), serde_json::json!([["text/plain"], "hello", 1]));
     }
 
     #[test]

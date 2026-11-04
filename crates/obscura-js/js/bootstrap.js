@@ -3487,7 +3487,8 @@ function _labeledControl(label) {
 // meter, output and progress are labelable but inert, while an <a> counts only
 // with an href.
 const _INTERACTIVE = 'a[href],audio[controls],button,details,embed,iframe,'
-  + 'img[usemap],input:not([type=hidden]),select,textarea,video[controls]';
+  + 'img[usemap],input:not([type=hidden]),select,textarea,video[controls],'
+  + '[contenteditable]:not([contenteditable=false])';
 
 const _forwardingLabels = new WeakSet();
 // Passed to click() only by label activation on behalf of a real input event,
@@ -7048,11 +7049,17 @@ class Document extends Node {
     if (!_documentInstances.has(this)) throw new TypeError('Illegal invocation');
     if (arguments.length < 1) throw new TypeError('queryCommandSupported requires 1 argument');
     commandId = `${commandId}`;
-    // execCommand currently implements no editing commands. Feature detection
-    // must not advertise clipboard or formatting actions that do nothing.
-    return false;
+    // Only the editing commands the editing layer implements are advertised;
+    // formatting commands still do nothing, so feature detection must not see them.
+    return globalThis.__obscura_queryCommandSupported(this, commandId);
   }
-  execCommand() { return false; }
+  execCommand(commandId, showUI, value) {
+    const method = _documentRealmMember(this, 'execCommand');
+    if (method) return Reflect.apply(method, this, arguments);
+    if (!_documentInstances.has(this)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'execCommand' on 'Document': 1 argument required, but only 0 present.");
+    return globalThis.__obscura_execCommand(this, `${commandId}`, showUI, value);
+  }
 }
 
 // Shared by write and the final EOF flush. A nonnegative parent is a real node,
@@ -15124,6 +15131,624 @@ globalThis.Selection = class Selection {
   modify() {}
 };
 _markNative(globalThis.Selection);
+
+// --- Editing: contenteditable, execCommand, clipboard ----------------------
+// Obscura had Selection and Range but no editing layer: execCommand was a stub
+// that returned false, and CDP typing only reached <input>/<textarea>. This
+// block adds the subset of Blink's editing behaviour that rich-text editors
+// depend on: an editing host and caret, text insertion with Blink's whitespace
+// rebalancing, paragraph splits and merges, the matching beforeinput/input
+// events, execCommand for those commands, DataTransfer, and the clipboard
+// shortcuts. CDP Input reaches it through the frozen __obscura_editing object.
+(function () {
+  const NBSP = '\u00a0';
+  const BLOCKS = new Set(['P', 'DIV', 'LI', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+    'BLOCKQUOTE', 'PRE', 'SECTION', 'ARTICLE', 'HEADER', 'FOOTER', 'TD', 'TH', 'DD', 'DT']);
+  const isWS = c => c === ' ' || c === NBSP;
+  const isText = n => n && n.nodeType === 3;
+  const isEl = n => n && n.nodeType === 1;
+  const isBR = n => isEl(n) && n.nodeName === 'BR';
+  const docOf = n => (n && n.ownerDocument) || globalThis.document;
+  const trusted = ev => globalThis.__obscura_markTrusted(ev);
+
+  function editableState(el) {
+    const v = el.getAttribute && el.getAttribute('contenteditable');
+    if (v === null || v === undefined) return 'inherit';
+    const s = String(v).toLowerCase();
+    if (s === '' || s === 'true') return 'true';
+    if (s === 'plaintext-only') return 'plaintext-only';
+    if (s === 'false') return 'false';
+    return 'inherit';
+  }
+
+  // The editing host is the outermost element of the contiguous editable
+  // region that contains node, or null when node is not editable.
+  function editingHost(node) {
+    let el = isEl(node) ? node : node && node.parentElement;
+    let host = null;
+    for (; el; el = el.parentElement) {
+      const st = editableState(el);
+      if (st === 'false') break;
+      if (st !== 'inherit') host = el;
+      else if (host === null) continue;
+    }
+    if (!host) return null;
+    // An explicit contenteditable=false between node and host makes node inert.
+    for (el = isEl(node) ? node : node.parentElement; el && el !== host; el = el.parentElement) {
+      if (editableState(el) === 'false') return null;
+    }
+    return host;
+  }
+
+  function blockOf(node, host) {
+    for (let el = isEl(node) ? node : node.parentElement; el; el = el.parentElement) {
+      if (el === host || BLOCKS.has(el.nodeName)) return el;
+    }
+    return host;
+  }
+
+  function selectionOf(doc) {
+    return doc && typeof doc.getSelection === 'function' ? doc.getSelection() : null;
+  }
+
+  function caret(doc) {
+    const sel = selectionOf(doc);
+    return sel && sel.rangeCount ? sel.getRangeAt(0) : null;
+  }
+
+  function setCaret(node, offset) {
+    const sel = selectionOf(docOf(node));
+    if (sel) sel.collapse(node, offset);
+  }
+
+  // Descend from (container, offset) to the innermost position that text can
+  // go into, the way Blink canonicalises a caret before inserting.
+  function canonical(c, o) {
+    for (let guard = 0; guard < 64 && isEl(c); guard++) {
+      const kids = c.childNodes;
+      const after = kids[o], before = kids[o - 1];
+      if (isEl(after) && !isBR(after) && editableState(after) !== 'false') { c = after; o = 0; continue; }
+      if (isText(after) && !before) { c = after; o = 0; break; }
+      if (isText(before)) { c = before; o = before.length; break; }
+      if (isEl(before) && !isBR(before) && !after && editableState(before) !== 'false') {
+        c = before; o = before.childNodes.length; continue;
+      }
+      break;
+    }
+    return [c, o];
+  }
+
+  function firstPosition(host) { return canonical(host, 0); }
+
+  function selectionInside(host) {
+    const r = caret(docOf(host));
+    return !!(r && host.contains(r.startContainer) && host.contains(r.endContainer));
+  }
+
+  // Programmatic focus of an editing host puts the caret at its start unless
+  // the selection is already inside it (Blink behaviour).
+  function ensureCaret(host) {
+    if (selectionInside(host)) return;
+    const [c, o] = firstPosition(host);
+    setCaret(c, o);
+  }
+
+  function placeCaretAtEnd(node, host) {
+    const target = blockOf(node, host);
+    const [c, o] = canonical(target, target.childNodes.length);
+    setCaret(c, o);
+  }
+
+  function hasContent(el) {
+    if ((el.textContent || '') !== '') return true;
+    return !!(el.querySelector && el.querySelector('br,img,hr,input,iframe,video,audio,canvas'));
+  }
+
+  function dropEmptyText(el) {
+    for (const n of Array.from(el.childNodes)) {
+      if (isText(n) && n.length === 0) el.removeChild(n);
+      else if (isEl(n) && !BLOCKS.has(n.nodeName) && !isBR(n) && !hasContent(n)) el.removeChild(n);
+    }
+  }
+
+  function fillEmptyBlock(el) {
+    dropEmptyText(el);
+    if (!hasContent(el)) el.appendChild(docOf(el).createElement('br'));
+  }
+
+  function textBefore(node, offset, block) {
+    const r = new Range();
+    r.setStart(block, 0); r.setEnd(node, offset);
+    return r.toString();
+  }
+  function textAfter(node, offset, block) {
+    const r = new Range();
+    r.setStart(node, offset); r.setEnd(block, block.childNodes.length);
+    return r.toString();
+  }
+
+  // Blink's RebalanceWhitespaceAt: the run of spaces touching an edit point
+  // is rewritten so that a space at the start or end of the paragraph, or
+  // right after another space, is a no-break space and survives collapsing.
+  // Runs strictly inside inserted text are left exactly as inserted.
+  function rebalanceAt(t, pos, host) {
+    const d = t.data;
+    pos = Math.max(0, Math.min(pos, d.length));
+    let a = pos, b = pos;
+    while (a > 0 && isWS(d[a - 1])) a--;
+    while (b < d.length && isWS(d[b])) b++;
+    if (a === b) return;
+    const block = blockOf(t, host);
+    const atStart = a === 0 && textBefore(t, 0, block) === '';
+    const atEnd = b === d.length && textAfter(t, d.length, block) === '';
+    let run = '', prevSpace = false;
+    for (let k = a; k < b; k++) {
+      if (prevSpace || (k === a && atStart) || (k === b - 1 && atEnd)) { run += NBSP; prevSpace = false; }
+      else { run += ' '; prevSpace = true; }
+    }
+    const out = d.slice(0, a) + run + d.slice(b);
+    if (out !== d) t.data = out;
+  }
+  // Rebalance after inserting [from, to) into t: the run at the end, then the
+  // run at the start unless the inserted text was nothing but spaces.
+  function rebalance(t, from, to, host) {
+    rebalanceAt(t, to, host);
+    const inserted = t.data.slice(from, to);
+    if (from === to || /[^ \u00a0]/.test(inserted)) rebalanceAt(t, from, host);
+  }
+
+  function deleteSelection(host) {
+    const r = caret(docOf(host));
+    if (!r || r.collapsed) return;
+    const block = blockOf(r.startContainer, host);
+    const [sc, so] = [r.startContainer, r.startOffset];
+    r.deleteContents();
+    setCaret(sc, so);
+    if (block !== host && block.isConnected) fillEmptyBlock(block);
+    else if (!hasContent(host)) { dropEmptyText(host); setCaret(host, 0); }
+  }
+
+  function insertPlain(host, s) {
+    if (!s) return;
+    const doc = docOf(host);
+    const r = caret(doc);
+    let [c, o] = canonical(r.startContainer, r.startOffset);
+    let t, start;
+    if (isText(c)) {
+      t = c; start = o; t.insertData(o, s);
+    } else {
+      // A block whose only content is a placeholder <br> gives it up to text.
+      const kids = c.childNodes;
+      if (kids.length === 1 && isBR(kids[0])) { c.removeChild(kids[0]); o = 0; }
+      const before = c.childNodes[o - 1], after = c.childNodes[o];
+      if (isText(before)) { t = before; start = t.length; t.appendData(s); }
+      else if (isText(after)) { t = after; start = 0; t.insertData(0, s); }
+      else { t = doc.createTextNode(s); c.insertBefore(t, after || null); start = 0; }
+    }
+    setCaret(t, start + s.length);
+    rebalance(t, start, start + s.length, host);
+    // Rebalancing never changes the length, so the caret offset still holds.
+    setCaret(t, Math.min(start + s.length, t.length));
+  }
+
+  function splitParagraph(host) {
+    const doc = docOf(host);
+    const r = caret(doc);
+    let [c, o] = canonical(r.startContainer, r.startOffset);
+    const block = blockOf(c, host);
+    const tail = new Range();
+    tail.setStart(c, o);
+    tail.setEnd(block, block.childNodes.length);
+    const frag = tail.extractContents();
+    let fresh;
+    if (block === host) {
+      // Bare text directly in the host: Blink starts the new line as a <div>.
+      fresh = doc.createElement('div');
+      fresh.appendChild(frag);
+      host.appendChild(fresh);
+      if (!hasContent(host.firstChild === fresh ? fresh : host)) fillEmptyBlock(host);
+    } else {
+      fresh = block.cloneNode(false);
+      fresh.appendChild(frag);
+      block.parentNode.insertBefore(fresh, block.nextSibling);
+      fillEmptyBlock(block);
+    }
+    fillEmptyBlock(fresh);
+    // The end of the old paragraph is now a paragraph end: rebalance it.
+    const lastText = (() => {
+      let n = block === host ? fresh.previousSibling : block.lastChild;
+      while (n && !isText(n)) n = isEl(n) && !isBR(n) ? n.lastChild : n.previousSibling;
+      return n;
+    })();
+    if (lastText && lastText.length) rebalance(lastText, lastText.length, lastText.length, host);
+    const [fc, fo] = firstPosition(fresh);
+    setCaret(fc, fo);
+  }
+
+  function insertLineBreak(host) {
+    const doc = docOf(host);
+    const r = caret(doc);
+    let [c, o] = canonical(r.startContainer, r.startOffset);
+    const br = doc.createElement('br');
+    if (isText(c)) {
+      const rest = o < c.length ? c.splitText(o) : null;
+      c.parentNode.insertBefore(br, rest || c.nextSibling);
+    } else {
+      c.insertBefore(br, c.childNodes[o] || null);
+    }
+    const block = blockOf(br, host);
+    // A <br> that ends a block needs a second one to make the new line visible.
+    if (textAfter(br.parentNode, Array.prototype.indexOf.call(br.parentNode.childNodes, br) + 1, block) === ''
+        && !(br.nextSibling && isBR(br.nextSibling))) {
+      br.parentNode.insertBefore(doc.createElement('br'), br.nextSibling);
+    }
+    const idx = Array.prototype.indexOf.call(br.parentNode.childNodes, br) + 1;
+    setCaret(br.parentNode, idx);
+  }
+
+  function insertText(host, text) {
+    deleteSelection(host);
+    const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
+    const plain = editableState(host) === 'plaintext-only';
+    lines.forEach((line, i) => {
+      if (i > 0) plain ? insertLineBreak(host) : splitParagraph(host);
+      insertPlain(host, line);
+    });
+  }
+
+  function surrogateBack(str, p) {
+    if (p >= 2) {
+      const lo = str.charCodeAt(p - 1), hi = str.charCodeAt(p - 2);
+      if (lo >= 0xDC00 && lo <= 0xDFFF && hi >= 0xD800 && hi <= 0xDBFF) return 2;
+    }
+    return 1;
+  }
+
+  function mergeInto(target, source, host) {
+    // Move source's content to the end of target, dropping placeholder <br>s.
+    const placeholder = target.childNodes.length === 1 && isBR(target.firstChild);
+    if (placeholder) target.removeChild(target.firstChild);
+    const [jc, jo] = canonical(target, target.childNodes.length);
+    const keep = Array.from(source.childNodes).filter(n => !(isBR(n) && source.childNodes.length === 1));
+    for (const n of keep) target.appendChild(n);
+    source.parentNode.removeChild(source);
+    fillEmptyBlock(target);
+    if (isText(jc) && jc.isConnected) { setCaret(jc, jo); rebalance(jc, jo, jo, host); }
+    else { const [c, o] = canonical(target, placeholder ? 0 : Math.min(jo, target.childNodes.length)); setCaret(c, o); }
+  }
+
+  function deleteBackward(host) {
+    const r = caret(docOf(host));
+    if (!r.collapsed) { deleteSelection(host); return; }
+    let [c, o] = canonical(r.startContainer, r.startOffset);
+    if (isText(c) && o > 0) {
+      const n = surrogateBack(c.data, o);
+      c.deleteData(o - n, n);
+      const block = blockOf(c, host);
+      if (c.length === 0 && block !== host) { const p = c.parentNode; p.removeChild(c); fillEmptyBlock(block); setCaret(block, 0); return; }
+      setCaret(c, o - n);
+      rebalance(c, o - n, o - n, host);
+      return;
+    }
+    if (isEl(c) && o > 0 && isBR(c.childNodes[o - 1])) {
+      c.removeChild(c.childNodes[o - 1]);
+      const block = blockOf(c, host);
+      if (block !== host) fillEmptyBlock(block);
+      const [cc, co] = canonical(c, Math.min(o - 1, c.childNodes.length)); setCaret(cc, co);
+      return;
+    }
+    const block = blockOf(c, host);
+    if (block === host || textBefore(c, o, block) !== '') return;
+    let prev = block.previousSibling;
+    while (prev && !isEl(prev)) prev = prev.previousSibling;
+    if (prev && host.contains(prev) && prev !== host) mergeInto(prev, block, host);
+  }
+
+  function deleteForward(host) {
+    const r = caret(docOf(host));
+    if (!r.collapsed) { deleteSelection(host); return; }
+    let [c, o] = canonical(r.startContainer, r.startOffset);
+    if (isText(c) && o < c.length) {
+      const code = c.data.charCodeAt(o);
+      const n = code >= 0xD800 && code <= 0xDBFF && o + 1 < c.length ? 2 : 1;
+      c.deleteData(o, n);
+      const block = blockOf(c, host);
+      if (c.length === 0 && block !== host) { c.parentNode.removeChild(c); fillEmptyBlock(block); setCaret(block, 0); return; }
+      setCaret(c, o);
+      rebalance(c, o, o, host);
+      return;
+    }
+    const block = blockOf(c, host);
+    if (block === host || textAfter(c, o, block) !== '') return;
+    let next = block.nextSibling;
+    while (next && !isEl(next)) next = next.nextSibling;
+    if (next && host.contains(next)) mergeInto(block, next, host);
+  }
+
+  function selectAll(doc, host) {
+    const sel = selectionOf(doc);
+    if (!sel) return;
+    sel.selectAllChildren(host || doc.body || doc.documentElement);
+  }
+
+  const ACTIONS = {
+    insertText: (host, data) => insertText(host, data),
+    insertFromPaste: (host, data) => insertText(host, data),
+    insertParagraph: host => { deleteSelection(host); splitParagraph(host); },
+    insertLineBreak: host => { deleteSelection(host); insertLineBreak(host); },
+    deleteContentBackward: host => deleteBackward(host),
+    deleteContentForward: host => deleteForward(host),
+  };
+
+  // Text controls: the same commands applied to value and the selection range.
+  function isTextControl(el) {
+    if (!el) return false;
+    if (el.localName === 'textarea') return true;
+    if (el.localName !== 'input') return false;
+    const t = (el.getAttribute('type') || 'text').toLowerCase();
+    return ['text', 'search', 'url', 'tel', 'email', 'password', ''].includes(t);
+  }
+  function editTextControl(el, inputType, data) {
+    if (globalThis.__obscura_isDisabled(el) || el.hasAttribute('readonly')) return false;
+    const v = el.value || '';
+    let s = el.selectionStart, e = el.selectionEnd;
+    s = s == null ? v.length : Math.max(0, Math.min(s, v.length));
+    e = e == null ? s : Math.max(0, Math.min(e, v.length));
+    let lo = Math.min(s, e), hi = Math.max(s, e), ins = '';
+    if (inputType === 'insertText' || inputType === 'insertFromPaste') {
+      ins = String(data == null ? '' : data);
+      if (el.localName === 'input') ins = ins.replace(/[\r\n]+/g, '');
+    } else if (inputType === 'insertParagraph' || inputType === 'insertLineBreak') {
+      if (el.localName !== 'textarea') return false;
+      ins = '\n';
+    } else if (inputType === 'deleteContentBackward') {
+      if (lo === hi) { if (lo === 0) return true; lo -= surrogateBack(v, lo); }
+    } else if (inputType === 'deleteContentForward') {
+      if (lo === hi) { if (hi >= v.length) return true; hi += 1; }
+    }
+    globalThis.__obscura_setFieldValue(el, 'value', v.slice(0, lo) + ins + v.slice(hi));
+    el.setSelectionRange(lo + ins.length, lo + ins.length);
+    return true;
+  }
+
+  // Runs one edit. beforeinput is fired for user edits only (Blink does not
+  // fire it for execCommand); input follows any edit that took place.
+  function runEdit(target, inputType, data, opts) {
+    const host = isTextControl(target) ? null : editingHost(target);
+    if (!host && !isTextControl(target)) return false;
+    const eventTarget = host || target;
+    const init = { bubbles: true, composed: true, inputType, data: data == null ? null : String(data) };
+    if (opts.dataTransfer) init.dataTransfer = opts.dataTransfer;
+    if (opts.beforeinput) {
+      const before = trusted(new InputEvent('beforeinput', Object.assign({ cancelable: true }, init)));
+      if (!eventTarget.dispatchEvent(before)) return true;
+    }
+    if (host) {
+      if (opts.ensureCaret !== false) ensureCaret(host);
+      ACTIONS[inputType](host, data);
+    } else if (!editTextControl(target, inputType, data)) {
+      return false;
+    }
+    eventTarget.dispatchEvent(trusted(new InputEvent('input', init)));
+    return true;
+  }
+
+  function editTargetFor(doc) {
+    const active = doc.activeElement;
+    if (isTextControl(active)) return active;
+    const r = caret(doc);
+    if (r) {
+      const h = editingHost(r.startContainer);
+      if (h) return h;
+    }
+    if (active && editingHost(active)) return editingHost(active);
+    return null;
+  }
+
+  // --- execCommand ----------------------------------------------------------
+  const COMMANDS = {
+    inserttext: ['insertText', true],
+    insertparagraph: ['insertParagraph', false],
+    insertlinebreak: ['insertLineBreak', false],
+    delete: ['deleteContentBackward', false],
+    forwarddelete: ['deleteContentForward', false],
+  };
+  const SUPPORTED = new Set([...Object.keys(COMMANDS), 'selectall', 'copy', 'cut', 'paste']);
+
+  function queryCommandSupported(doc, command) {
+    return SUPPORTED.has(String(command).toLowerCase());
+  }
+
+  function execCommand(doc, command, _showUI, value) {
+    const cmd = String(command).toLowerCase();
+    if (cmd === 'selectall') {
+      const target = editTargetFor(doc);
+      if (isTextControl(target)) target.select(); else selectAll(doc, target);
+      return true;
+    }
+    // Blink requires transient user activation for clipboard commands run by
+    // page script; there is none to consume here, so they report failure and
+    // leave the clipboard alone. The keyboard shortcuts go through CDP Input.
+    if (cmd === 'copy' || cmd === 'cut' || cmd === 'paste') return false;
+    const spec = COMMANDS[cmd];
+    if (!spec) return false;
+    const target = editTargetFor(doc);
+    if (!target) return false;
+    return runEdit(target, spec[0], spec[1] ? (value == null ? '' : String(value)) : null,
+      { beforeinput: false, ensureCaret: true });
+  }
+
+  // --- Clipboard ------------------------------------------------------------
+  let clipboardText = '';
+
+  function selectedText(doc) {
+    const active = doc.activeElement;
+    const password = active && active.localName === 'input' && (active.getAttribute('type') || '').toLowerCase() === 'password';
+    if (isTextControl(active) && !password) {
+      const v = active.value || '';
+      const s = active.selectionStart, e = active.selectionEnd;
+      if (s != null && e != null && s !== e) return v.slice(Math.min(s, e), Math.max(s, e));
+    }
+    const sel = selectionOf(doc);
+    return sel ? sel.toString() : '';
+  }
+
+  function clipboardAction(doc, kind, userGesture) {
+    const target = doc.activeElement || doc.body;
+    if (!target) return false;
+    const data = new DataTransfer();
+    const ev = new ClipboardEvent(kind, { bubbles: true, cancelable: true, composed: true, clipboardData: data });
+    if (userGesture) trusted(ev);
+    if (kind === 'paste') {
+      data.setData('text/plain', clipboardText);
+      data._readOnly = true;
+      if (!target.dispatchEvent(ev)) return true;
+      const editTarget = editTargetFor(doc);
+      if (editTarget) runEdit(editTarget, 'insertFromPaste', clipboardText, { beforeinput: true, dataTransfer: data });
+      return true;
+    }
+    if (!target.dispatchEvent(ev)) {
+      // A handler that cancels copy/cut supplies the clipboard contents itself.
+      if (data.types.includes('text/plain')) clipboardText = data.getData('text/plain');
+      return true;
+    }
+    const text = selectedText(doc);
+    if (text === '') return true;
+    clipboardText = text;
+    if (kind === 'cut') {
+      const editTarget = editTargetFor(doc);
+      if (editTarget) runEdit(editTarget, 'deleteContentBackward', null, { beforeinput: true });
+    }
+    return true;
+  }
+
+  // --- DataTransfer -----------------------------------------------------------
+  function normFormat(f) {
+    f = String(f).toLowerCase();
+    if (f === 'text') return 'text/plain';
+    if (f === 'url') return 'text/uri-list';
+    return f;
+  }
+  class DataTransferItem {
+    constructor(dt, type) { this._dt = dt; this._type = type; }
+    get kind() { return 'string'; }
+    get type() { return this._type; }
+    getAsString(cb) { if (typeof cb === 'function') { const v = this._dt.getData(this._type); setTimeout(() => cb(v), 0); } }
+    getAsFile() { return null; }
+  }
+  class DataTransferItemList {
+    constructor(dt) { this._dt = dt; }
+    get length() { return this._dt._data.size; }
+    add(data, type) {
+      if (typeof data !== 'string') return null;
+      const t = normFormat(type);
+      if (this._dt._data.has(t)) throw new DOMException('An item already exists for type ' + t, 'NotSupportedError');
+      this._dt.setData(t, data);
+      return new DataTransferItem(this._dt, t);
+    }
+    remove(i) { const t = [...this._dt._data.keys()][i]; if (t !== undefined) this._dt._data.delete(t); }
+    clear() { this._dt._data.clear(); }
+    [Symbol.iterator]() { return [...this._dt._data.keys()].map(t => new DataTransferItem(this._dt, t))[Symbol.iterator](); }
+  }
+  class DataTransfer {
+    constructor() {
+      this._data = new Map();
+      this._readOnly = false;
+      this.dropEffect = 'none';
+      this.effectAllowed = 'uninitialized';
+    }
+    get types() { return Object.freeze([...this._data.keys()]); }
+    get files() { return typeof FileList === 'function' && FileList._from ? FileList._from([]) : Object.freeze([]); }
+    get items() { return new DataTransferItemList(this); }
+    getData(format) { return this._data.get(normFormat(format)) ?? ''; }
+    setData(format, data) { if (!this._readOnly) this._data.set(normFormat(format), String(data)); }
+    clearData(format) {
+      if (this._readOnly) return;
+      if (format === undefined) this._data.clear(); else this._data.delete(normFormat(format));
+    }
+    setDragImage() {}
+  }
+  for (const C of [DataTransfer, DataTransferItem, DataTransferItemList]) _markNative(C);
+  Object.defineProperty(globalThis, 'DataTransfer', { value: DataTransfer, writable: true, configurable: true });
+  Object.defineProperty(globalThis, 'DataTransferItem', { value: DataTransferItem, writable: true, configurable: true });
+  Object.defineProperty(globalThis, 'DataTransferItemList', { value: DataTransferItemList, writable: true, configurable: true });
+
+  // ClipboardEvent and InputEvent carry their data objects (they were bare).
+  const BaseClipboardEvent = globalThis.ClipboardEvent;
+  globalThis.ClipboardEvent = _markNative(class ClipboardEvent extends BaseClipboardEvent {
+    constructor(type, init) { super(type, init); this.clipboardData = (init && init.clipboardData) || null; }
+  });
+  const BaseInputEvent = globalThis.InputEvent;
+  globalThis.InputEvent = _markNative(class InputEvent extends BaseInputEvent {
+    constructor(type, init) {
+      super(type, init);
+      const i = init || {};
+      this.dataTransfer = i.dataTransfer || null;
+      this.isComposing = !!i.isComposing;
+    }
+    getTargetRanges() { return []; }
+  });
+
+  // --- Element reflection and focus ----------------------------------------------
+  const EP = globalThis.Element.prototype;
+  if (!Object.getOwnPropertyDescriptor(EP, 'isContentEditable')) {
+    Object.defineProperty(EP, 'isContentEditable', {
+      configurable: true, enumerable: true,
+      get: _markNativeAs(function () { return !!(this.isConnected && editingHost(this)); }, 'function get isContentEditable() { [native code] }'),
+    });
+  }
+  if (!Object.getOwnPropertyDescriptor(EP, 'contentEditable')) {
+    Object.defineProperty(EP, 'contentEditable', {
+      configurable: true, enumerable: true,
+      get: _markNativeAs(function () {
+        const st = editableState(this);
+        return st === 'true' || st === 'false' || st === 'plaintext-only' ? st : 'inherit';
+      }, 'function get contentEditable() { [native code] }'),
+      set: _markNativeAs(function (v) {
+        const s = String(v).toLowerCase();
+        if (s === 'inherit') this.removeAttribute('contenteditable');
+        else if (s === 'true' || s === 'false' || s === 'plaintext-only') this.setAttribute('contenteditable', s);
+        else throw new DOMException("The value provided ('" + v + "') is not one of 'true', 'false', 'plaintext-only', or 'inherit'.", 'SyntaxError');
+      }, 'function set contentEditable() { [native code] }'),
+    });
+  }
+  const originalFocus = EP.focus;
+  EP.focus = _markNative(function focus(options) {
+    const result = Reflect.apply(originalFocus, this, arguments);
+    const host = editingHost(this);
+    if (host === this && globalThis.__obscura_focused === this) ensureCaret(host);
+    return result;
+  });
+
+  // --- Hooks for CDP Input --------------------------------------------------
+  const api = {
+    // A user edit at the focused element; false when nothing there is editable,
+    // so the caller keeps its own <input>/<textarea> behaviour.
+    user(inputType, data) {
+      const doc = globalThis.document;
+      const active = doc.activeElement;
+      if (!active || isTextControl(active)) return false;
+      const host = editingHost(active);
+      if (!host) return false;
+      return runEdit(host, inputType, data, { beforeinput: true, ensureCaret: true });
+    },
+    clickCaret(target) {
+      const host = target && editingHost(target);
+      if (host && !selectionInside(host)) placeCaretAtEnd(target, host);
+    },
+    shortcut(kind) { return clipboardAction(globalThis.document, kind, true); },
+    selectAll() { return execCommand(globalThis.document, 'selectAll'); },
+    isEditable(el) { return !!(el && (isTextControl(el) || editingHost(el))); },
+  };
+  Object.freeze(api);
+  Object.defineProperty(globalThis, '__obscura_editing', { value: api, writable: false, configurable: false, enumerable: false });
+  globalThis.__obscura_execCommand = execCommand;
+  globalThis.__obscura_queryCommandSupported = queryCommandSupported;
+  for (const n of ['__obscura_execCommand', '__obscura_queryCommandSupported']) {
+    Object.defineProperty(globalThis, n, { writable: false, configurable: false, enumerable: false });
+  }
+})();
+
 
 [
   navigator.getBattery, navigator.getGamepads, navigator.sendBeacon,

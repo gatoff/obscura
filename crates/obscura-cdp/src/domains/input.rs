@@ -26,10 +26,11 @@ fn insert_text_js(text: &str, ime_commit: bool) -> String {
     format!(
         "(function() {{\
             var t = document.activeElement;\
+            var ins = {text};\
+            if (globalThis.__obscura_editing.user('insertText', ins)) return;\
             if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
             if (globalThis.__obscura_isDisabled(t)) return;\
             if (!{ime_commit} && t.hasAttribute('readonly')) return;\
-            var ins = {text};\
             var commitStart = {ime_commit} ? t.selectionStart : null;\
             if ({ime_commit} && commitStart == null) commitStart = (t.value || '').length;\
             var before = globalThis.__obscura_markTrusted(new InputEvent('beforeinput', {{bubbles:true,composed:true,cancelable:true,data:ins,inputType:'insertText'}}));\
@@ -58,6 +59,7 @@ fn insert_text_js(text: &str, ime_commit: bool) -> String {
 // collapsed caret it removes the character before the caret, and with no
 // selection tracked it falls back to trimming the last character (legacy).
 const BACKSPACE_JS: &str = "(function() {\
+    if (globalThis.__obscura_editing.user('deleteContentBackward', null)) return;\
     var t = document.activeElement;\
     if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
     if (t.hasAttribute('readonly')) return;\
@@ -90,6 +92,7 @@ const BACKSPACE_JS: &str = "(function() {\
 })()";
 
 const DELETE_JS: &str = "(function() {\
+    if (globalThis.__obscura_editing.user('deleteContentForward', null)) return;\
     var t = document.activeElement;\
     if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
     if (t.hasAttribute('readonly')) return;\
@@ -221,7 +224,7 @@ pub async fn handle(
                             target.dispatchEvent(evt);\
                             if (!evt.defaultPrevented) {{\
                                 var focusTarget = globalThis.__obscura_interactiveHost(target) || (target.closest && target.closest('[tabindex]'));\
-                                if (focusTarget && !globalThis.__obscura_isDisabled(focusTarget)) focusTarget.focus();\
+                                if (focusTarget && !globalThis.__obscura_isDisabled(focusTarget)) {{ focusTarget.focus(); globalThis.__obscura_editing.clickCaret(target); }}\
                                 else if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();\
                             }}\
                         }})()",
@@ -446,6 +449,35 @@ pub async fn handle(
                             return Ok(json!({}));
                         }
 
+                        // Editing shortcuts: Ctrl (Cmd on a Mac) with C/X/V/A, or the
+                        // editing commands Playwright sends alongside the key on macOS.
+                        let commands: Vec<String> = params
+                            .get("commands")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.iter().filter_map(|c| c.as_str().map(|c| c.to_ascii_lowercase())).collect())
+                            .unwrap_or_default();
+                        let accel = (ctrl_key || meta_key) && !alt_key;
+                        let shortcut = if commands.iter().any(|c| c == "copy") || (accel && code == "KeyC") {
+                            Some("copy")
+                        } else if commands.iter().any(|c| c == "cut") || (accel && code == "KeyX") {
+                            Some("cut")
+                        } else if commands.iter().any(|c| c == "paste") || (accel && code == "KeyV" && !shift_key) {
+                            Some("paste")
+                        } else if commands.iter().any(|c| c == "selectall") || (accel && code == "KeyA") {
+                            Some("selectAll")
+                        } else {
+                            None
+                        };
+                        if let Some(action) = shortcut {
+                            let js = if action == "selectAll" {
+                                "globalThis.__obscura_editing.selectAll()".to_string()
+                            } else {
+                                format!("globalThis.__obscura_editing.shortcut('{action}')")
+                            };
+                            page.evaluate(&js);
+                            return Ok(json!({}));
+                        }
+
                         if !text.is_empty() && text != "\r" && text != "\n" {
                             page.evaluate(&insert_text_js(text, false));
                         }
@@ -458,7 +490,8 @@ pub async fn handle(
                             let js = "(function() {\
                                 var target = document.activeElement;\
                                 if (!target) return;\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter',keyCode:$VK,which:$VK,charCode:$VK,$MODIFIERS})));\
+                                if (!target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,cancelable:true,key:'Enter',code:'Enter',keyCode:$VK,which:$VK,charCode:$VK,$MODIFIERS})))) return;\
+                                if (globalThis.__obscura_editing.user($SHIFT ? 'insertLineBreak' : 'insertParagraph', null)) return;\
                                 if (target.localName === 'textarea') {\
                                     if (target.hasAttribute('readonly')) return;\
                                     var value = target.value || '';\
@@ -474,7 +507,8 @@ pub async fn handle(
                                     if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(); }} else {{ form.submit(); }} }} catch(e) {{}} }}\
                                 }\
                             })()".replace("$VK", &virtual_key_code.to_string())
-                                .replace("$MODIFIERS", &format!("altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}"));
+                                .replace("$MODIFIERS", &format!("altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}"))
+                                .replace("$SHIFT", if shift_key { "true" } else { "false" });
                             page.evaluate(&js);
                         }
 
