@@ -428,6 +428,10 @@ pub async fn handle(
                 .get("windowsVirtualKeyCode")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            // Chrome reports held-key repeats as KeyboardEvent.repeat; pages use
+            // it to tell a repeat from a fresh press.
+            let auto_repeat = params.get("autoRepeat").and_then(|v| v.as_bool()).unwrap_or(false);
+            let location = params.get("location").and_then(|v| v.as_u64()).unwrap_or(0);
 
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 match event_type {
@@ -435,7 +439,7 @@ pub async fn handle(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},repeat:{auto_repeat},location:{location},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                                 return target.dispatchEvent(evt);\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
@@ -445,6 +449,8 @@ pub async fn handle(
                             key = js_str(key),
                             code = js_str(code),
                             virtual_key_code = virtual_key_code,
+                            auto_repeat = auto_repeat,
+                            location = location,
                         );
                         if page.evaluate(&js).as_bool() == Some(false) {
                             return Ok(json!({}));
