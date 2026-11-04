@@ -7704,6 +7704,9 @@ fn layout_dom_once(
             synthesize_row_rects(tree, &styles, &mut rects);
         }
     }
+    if let Some(root_id) = root {
+        synthesize_missing_inline_rects(tree, root_id, &mut rects, &styles, &text_runs, &mut inline_fragments);
+    }
     sync_positioned_pseudo_percentage_padding(&rects, &mut styles);
 
     let mut clip_rects = HashMap::new();
@@ -7918,6 +7921,105 @@ fn layout_dom_once(
         query_stats,
         cascade_time,
     )
+}
+
+/// Ordinary inline elements inside an inline formatting context that also
+/// holds atomic inlines (inputs, buttons, images, inline-blocks) are laid out
+/// as separate word leaves and never own a Taffy node, so they had no
+/// geometry: `getBoundingClientRect()` returned zeros and automation treated
+/// the element as invisible. Derive each such element's border-box fragments
+/// from the text runs and boxes it contains, one fragment per line, and their
+/// union as its bounding rect. Nested inlines are resolved before their parents.
+fn synthesize_missing_inline_rects(
+    tree: &DomTree,
+    root: NodeId,
+    rects: &mut HashMap<NodeId, Rect>,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    text_runs: &HashMap<NodeId, Vec<(Rect, String)>>,
+    inline_fragments: &mut HashMap<NodeId, Vec<Rect>>,
+) {
+    fn needs_rect(id: NodeId, rects: &HashMap<NodeId, Rect>, styles: &HashMap<NodeId, crate::LayoutStyle>) -> bool {
+        styles.get(&id).is_some_and(|style| {
+            style.ignores_used_box_sizes()
+                && !matches!(style.position, Some(taffy::Position::Absolute))
+        }) && !rects.contains_key(&id)
+    }
+    fn collect(
+        tree: &DomTree,
+        id: NodeId,
+        rects: &HashMap<NodeId, Rect>,
+        fragments: &HashMap<NodeId, Vec<Rect>>,
+        styles: &HashMap<NodeId, crate::LayoutStyle>,
+        text_runs: &HashMap<NodeId, Vec<(Rect, String)>>,
+        out: &mut Vec<Rect>,
+        depth: usize,
+    ) -> bool {
+        if depth > 256 {
+            return false;
+        }
+        for child in tree.children(id) {
+            // Block-in-inline splits the inline into anonymous boxes; its geometry
+            // (and its role as a containing block) is not a union of children.
+            if styles.get(&child).is_some_and(|s| {
+                s.display != crate::Display::None
+                    && s.display != crate::Display::Inline
+                    && !s.is_inline_block
+                    && !matches!(s.position, Some(taffy::Position::Absolute))
+            }) {
+                return false;
+            }
+            if let Some(runs) = text_runs.get(&child) {
+                out.extend(runs.iter().map(|(rect, _)| *rect).filter(|r| r.width > 0.0 || r.height > 0.0));
+            } else if let Some(pieces) = fragments.get(&child) {
+                out.extend(pieces.iter().copied());
+            } else if let Some(rect) = rects.get(&child) {
+                if styles.get(&child).is_some_and(|s| s.display != crate::Display::None) {
+                    out.push(*rect);
+                }
+            } else if !collect(tree, child, rects, fragments, styles, text_runs, out, depth + 1) {
+                return false;
+            }
+        }
+        true
+    }
+    // Post-order walk: children before parents.
+    let mut order = Vec::new();
+    let mut stack = vec![(root, false)];
+    while let Some((id, expanded)) = stack.pop() {
+        if expanded {
+            if needs_rect(id, rects, styles) {
+                order.push(id);
+            }
+            continue;
+        }
+        stack.push((id, true));
+        for child in tree.children(id).into_iter().rev() {
+            stack.push((child, false));
+        }
+    }
+    for id in order {
+        let mut pieces = Vec::new();
+        if !collect(tree, id, rects, inline_fragments, styles, text_runs, &mut pieces, 0) {
+            continue;
+        }
+        if pieces.is_empty() {
+            continue;
+        }
+        pieces.sort_by(|a, b| a.y.total_cmp(&b.y).then_with(|| a.x.total_cmp(&b.x)));
+        // Pieces whose vertical extents overlap share a line.
+        let mut lines: Vec<Rect> = Vec::new();
+        for piece in pieces {
+            match lines.last_mut() {
+                Some(line) if piece.y < line.y + line.height && line.y < piece.y + piece.height => {
+                    *line = line.union(&piece);
+                }
+                _ => lines.push(piece),
+            }
+        }
+        let union = lines[1..].iter().fold(lines[0], |acc, line| acc.union(line));
+        rects.insert(id, union);
+        inline_fragments.insert(id, lines);
+    }
 }
 
 /// Convert Taffy's ordinary-inline line surrogate into the element's actual
