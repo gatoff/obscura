@@ -8999,6 +8999,20 @@ mod tests {
     }
 
     #[test]
+    fn inner_text_honours_white_space_and_keeps_br_newlines() {
+        let mut rt = setup_runtime("<body><div id=d></div></body>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const d = document.getElementById('d');
+            const text = html => { d.innerHTML = html; return d.innerText; };
+            return [text('<p>line<span style="white-space:pre"> </span><br>next</p>'),
+                    text('<pre>a  b\n  c</pre>'),
+                    text('<div style="white-space:pre-line">a   b\n c</div>'),
+                    text('<p>a   b\n c</p>'),
+                    text('<p><br></p><p>lead</p>')];
+        })()"#).unwrap(), serde_json::json!(["line \nnext", "a  b\n  c", "a b\nc", "a b c", "\n\n\nlead"]));
+    }
+
+    #[test]
     fn editing_command_detection_checks_receiver_and_converts_domstring() {
         let mut rt = setup_runtime("<body></body>");
         assert_eq!(rt.evaluate(r#"(() => {

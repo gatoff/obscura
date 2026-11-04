@@ -4016,9 +4016,25 @@ const _innerTextBlockDisplays = new Set([
   'block', 'flow-root', 'flex', 'grid', 'list-item', 'table', 'table-caption',
 ]);
 
-function _collectInnerText(node, items, inheritedVisibility = 'visible') {
+// innerText honours white-space: preserved spaces and newlines are carried
+// through the collapsing passes as private-use placeholders.
+const _wsKeep = { space: '\uE000', newline: '\uE001', tab: '\uE002', br: '\uE003' };
+function _innerTextWhiteSpace(style, inherited) {
+  const v = String((style && (style.whiteSpace || (style.getPropertyValue && style.getPropertyValue('white-space')))) || '').trim();
+  return v || inherited;
+}
+function _protectWhiteSpace(text, mode) {
+  if (mode === 'pre' || mode === 'pre-wrap' || mode === 'break-spaces') {
+    return text.replace(/\r\n?/g, '\n').replace(/ /g, _wsKeep.space).replace(/\n/g, _wsKeep.newline).replace(/\t/g, _wsKeep.tab);
+  }
+  if (mode === 'pre-line') {
+    return text.replace(/\r\n?/g, '\n').replace(/[ \t\f]*\n[ \t\f]*/g, _wsKeep.newline);
+  }
+  return text;
+}
+function _collectInnerText(node, items, inheritedVisibility = 'visible', inheritedWhiteSpace = 'normal') {
   if (node.nodeType === 3) {
-    if (inheritedVisibility === 'visible') items.push(node.data ?? '');
+    if (inheritedVisibility === 'visible') items.push(_protectWhiteSpace(node.data ?? '', inheritedWhiteSpace));
     return;
   }
   if (node.nodeType !== 1) return;
@@ -4027,8 +4043,11 @@ function _collectInnerText(node, items, inheritedVisibility = 'visible') {
   const display = style.display;
   if (display === 'none') return;
   const visibility = style.visibility || inheritedVisibility;
+  const whiteSpace = _innerTextWhiteSpace(style, inheritedWhiteSpace);
   if (visibility === 'visible' && node.tagName === 'BR') {
-    items.push('\n');
+    // A <br> is content, not a required line break: it survives the
+    // trimming of leading and trailing line breaks.
+    items.push(_wsKeep.br);
     return;
   }
   const breaks = visibility === 'visible'
@@ -4036,7 +4055,7 @@ function _collectInnerText(node, items, inheritedVisibility = 'visible') {
     : 0;
   if (breaks) items.push(breaks);
   for (const child of node.childNodes) {
-    _collectInnerText(child, items, visibility);
+    _collectInnerText(child, items, visibility, whiteSpace);
   }
   if (visibility !== 'visible') return;
   if (display === 'table-cell') items.push('\t');
@@ -4046,8 +4065,9 @@ function _collectInnerText(node, items, inheritedVisibility = 'visible') {
 
 function _renderedInnerText(element) {
   const items = [];
+  const rootWhiteSpace = _innerTextWhiteSpace(getComputedStyle(element), 'normal');
   for (const child of element.childNodes) {
-    _collectInnerText(child, items);
+    _collectInnerText(child, items, 'visible', rootWhiteSpace);
   }
   let result = '';
   let pendingBreaks = 0;
@@ -4065,7 +4085,9 @@ function _renderedInnerText(element) {
     result += text;
   }
   return result.replace(/ +/g, ' ').replace(/ *\n */g, '\n')
-    .replace(/^[ \n\t]+|[ \n\t]+$/g, '');
+    .replace(/^[ \n\t]+|[ \n\t]+$/g, '')
+    .replace(/ *\uE003 */g, '\uE003')
+    .replace(/\uE000/g, ' ').replace(/[\uE001\uE003]/g, '\n').replace(/\uE002/g, '\t');
 }
 
 const _elementStyles = new WeakMap();
