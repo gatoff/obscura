@@ -7,9 +7,9 @@ use std::time::Duration;
 use obscura::Browser;
 
 const STEALTH_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 const ORDINARY_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
 
 fn spawn_server() -> (String, mpsc::Receiver<String>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

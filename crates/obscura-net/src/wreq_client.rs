@@ -57,11 +57,31 @@ impl wreq::dns::Resolve for SsrfGuardResolver {
     }
 }
 
+// The Chrome major version stealth mode presents, in one place. The TLS and
+// HTTP/2 emulation profile, the User-Agent, client hints and navigator all
+// derive from it, so the version a site reads from JavaScript can never
+// disagree with the one its TLS fingerprint implies. Raise it only to a version
+// wreq-util has an emulation profile for; `STEALTH_PROFILE` must name it too,
+// which the test below enforces.
 #[cfg(feature = "stealth")]
-pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+macro_rules! stealth_chrome_major {
+    () => {
+        "149"
+    };
+}
+#[cfg(feature = "stealth")]
+pub const STEALTH_CHROME_MAJOR: &str = stealth_chrome_major!();
+#[cfg(feature = "stealth")]
+pub(crate) const STEALTH_PROFILE: wreq_util::Profile = wreq_util::Profile::Chrome149;
 
-// The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
+#[cfg(feature = "stealth")]
+pub const STEALTH_USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/",
+    stealth_chrome_major!(),
+    ".0.0.0 Safari/537.36"
+);
+
+// The wreq emulation (STEALTH_PROFILE, Platform::Windows) sends this exact
 // UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
 // same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
 // site cross-checks the mismatch as a bot signal.
@@ -215,7 +235,7 @@ impl StealthHttpClient {
         allow_private_network: bool,
     ) -> Self {
         let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome145)
+            .profile(STEALTH_PROFILE)
             .platform(wreq_util::Platform::Windows)
             .build();
 
@@ -956,5 +976,16 @@ mod tests {
             .await
             .expect("loopback hostname must be reachable with the opt-in");
         assert_eq!(resp.status, 200);
+    }
+}
+
+#[cfg(all(test, feature = "stealth"))]
+mod stealth_version_tests {
+    use super::*;
+
+    #[test]
+    fn emulation_profile_matches_the_presented_chrome_version() {
+        assert_eq!(format!("{STEALTH_PROFILE:?}"), format!("Chrome{STEALTH_CHROME_MAJOR}"));
+        assert!(STEALTH_USER_AGENT.contains(&format!("Chrome/{STEALTH_CHROME_MAJOR}.0.0.0 ")));
     }
 }

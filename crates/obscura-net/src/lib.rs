@@ -24,7 +24,7 @@ pub use blocklist::is_blocked as is_tracker_blocked;
 #[cfg(feature = "stealth")]
 pub use wreq_client::{
     StealthHttpClient, STEALTH_NAVIGATOR_PLATFORM, STEALTH_UA_PLATFORM,
-    STEALTH_UA_PLATFORM_VERSION, STEALTH_USER_AGENT,
+    STEALTH_CHROME_MAJOR, STEALTH_UA_PLATFORM_VERSION, STEALTH_USER_AGENT,
 };
 
 mod operator_hint;
