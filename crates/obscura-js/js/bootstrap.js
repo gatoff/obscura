@@ -19684,6 +19684,14 @@ if (!Element.prototype.select) {
     _ns_selectionStart.set(this, 0);
     _ns_selectionEnd.set(this, len);
     _ns_selectionDir.set(this, 'none');
+    // Blink focuses a text control that select() is called on, so a following
+    // Ctrl+C copies the selected value.
+    if (this.isConnected && globalThis.__obscura_focused !== this
+        && (this.localName === 'input' || this.localName === 'textarea')
+        && !globalThis.__obscura_isDisabled(this) && typeof this.focus === 'function') {
+      this.focus();
+    }
+    this.dispatchEvent(new Event('select', { bubbles: true }));
   };
   _markNative(Element.prototype.select);
 }

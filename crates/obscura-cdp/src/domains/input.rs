@@ -225,6 +225,7 @@ pub async fn handle(
                             if (!evt.defaultPrevented) {{\
                                 var focusTarget = globalThis.__obscura_interactiveHost(target) || (target.closest && target.closest('[tabindex]'));\
                                 if (focusTarget && !globalThis.__obscura_isDisabled(focusTarget)) {{ focusTarget.focus(); globalThis.__obscura_editing.clickCaret(target); }}\
+                                else if (!focusTarget && document.activeElement && document.activeElement !== document.body && !(document.activeElement.contains && document.activeElement.contains(target))) {{ document.activeElement.blur(); }}\
                                 else if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();\
                             }}\
                         }})()",
