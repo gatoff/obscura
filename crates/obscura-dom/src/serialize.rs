@@ -176,10 +176,12 @@ impl DomTree {
     }
 }
 
+// HTML fragment serialization escapes U+00A0 as &nbsp; in text and attribute values.
 fn escape_text(s: &str, buf: &mut String) {
     for c in s.chars() {
         match c {
             '&' => buf.push_str("&amp;"),
+            '\u{a0}' => buf.push_str("&nbsp;"),
             '<' => buf.push_str("&lt;"),
             '>' => buf.push_str("&gt;"),
             _ => buf.push(c),
@@ -191,6 +193,7 @@ fn escape_attr(s: &str, buf: &mut String) {
     for c in s.chars() {
         match c {
             '&' => buf.push_str("&amp;"),
+            '\u{a0}' => buf.push_str("&nbsp;"),
             '"' => buf.push_str("&quot;"),
             _ => buf.push(c),
         }
@@ -234,6 +237,14 @@ mod tests {
         assert!(html.contains("<p>Hello</p>"));
         assert!(html.contains("<p>World</p>"));
         assert!(!html.contains("<div"));
+    }
+
+    #[test]
+    fn no_break_spaces_serialize_as_entities() {
+        let tree = parse_html("<div id=\"test\" title=\"a&nbsp;b\">line&nbsp;<b>x\u{a0}y</b></div>");
+        let div = tree.get_element_by_id("test").unwrap();
+        assert_eq!(tree.inner_html(div), "line&nbsp;<b>x&nbsp;y</b>");
+        assert!(tree.outer_html(div).contains("title=\"a&nbsp;b\""));
     }
 
     #[test]
