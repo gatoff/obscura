@@ -752,7 +752,76 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     dispatch_with_deferred(req, ctx, None).await
 }
 
+// Chromium-shaped remote object ids ("<prefix>.<executionContextId>.<rest>").
+// Patchright avoids Runtime.enable and recovers the main world's context id
+// by parsing `objectId.split(".")[1]`; Obscura's own ids are opaque JSON keys,
+// so they are wrapped on the way out and unwrapped on the way in.
+const OID_PREFIX: &str = "ob.";
+
+fn unwrap_object_ids(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                if k == "objectId" {
+                    if let Some(s) = val.as_str() {
+                        if let Some(rest) = s.strip_prefix(OID_PREFIX) {
+                            if let Some((_, oid)) = rest.split_once('.') {
+                                *val = serde_json::Value::String(oid.to_string());
+                                continue;
+                            }
+                        }
+                    }
+                }
+                unwrap_object_ids(val);
+            }
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(unwrap_object_ids),
+        _ => {}
+    }
+}
+
+fn wrap_object_ids(v: &mut serde_json::Value, context_id: i64) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                if k == "objectId" {
+                    if let Some(s) = val.as_str() {
+                        if !s.starts_with(OID_PREFIX) {
+                            *val = serde_json::Value::String(format!("{OID_PREFIX}{context_id}.{s}"));
+                        }
+                        continue;
+                    }
+                }
+                wrap_object_ids(val, context_id);
+            }
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| wrap_object_ids(x, context_id)),
+        _ => {}
+    }
+}
+
 pub(crate) async fn dispatch_with_deferred(
+    req: &CdpRequest,
+    ctx: &mut CdpContext,
+    deferred: Option<&mut Option<domains::runtime::DeferredEvaluation>>,
+) -> CdpResponse {
+    let mut inner_req = req.clone();
+    unwrap_object_ids(&mut inner_req.params);
+    let mut resp = Box::pin(dispatch_with_deferred_inner(&inner_req, ctx, deferred)).await;
+    if let Some(result) = resp.result.as_mut() {
+        let explicit = req.params.get("contextId").or_else(|| req.params.get("executionContextId"))
+            .and_then(|v| v.as_i64());
+        let context_id = explicit.or_else(|| {
+            req.session_id.as_ref()
+                .and_then(|sid| ctx.sessions.get(sid).cloned())
+                .and_then(|page_id| ctx.default_context_id(&page_id))
+        }).unwrap_or(1);
+        wrap_object_ids(result, context_id);
+    }
+    resp
+}
+
+async fn dispatch_with_deferred_inner(
     req: &CdpRequest,
     ctx: &mut CdpContext,
     deferred: Option<&mut Option<domains::runtime::DeferredEvaluation>>,
