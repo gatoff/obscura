@@ -19174,6 +19174,48 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   }
 })();
 
+// Chrome defines every navigator attribute as an accessor on
+// Navigator.prototype, and the navigator object itself has no own properties
+// and Navigator.prototype as its direct prototype. Obscura built navigator as an
+// object literal over an extra spoofing prototype, so
+// Object.getOwnPropertyNames(navigator) listed some thirty names and an author
+// override such as Object.defineProperty(Navigator.prototype, 'platform', ...)
+// was shadowed. Both are well-known automation tells. Re-home everything onto
+// Navigator.prototype, nearest definition winning, once nothing else adds to it.
+(function _relayoutNavigator() {
+  const nav = globalThis.navigator;
+  const proto = Navigator.prototype;
+  if (!nav || Object.getPrototypeOf(nav) === proto && Reflect.ownKeys(nav).length === 0) return;
+  const layers = [];
+  for (let layer = Object.getPrototypeOf(nav); layer && layer !== proto && layer !== Object.prototype;
+       layer = Object.getPrototypeOf(layer)) {
+    layers.unshift(layer);
+  }
+  layers.push(nav);
+  for (const layer of layers) {
+    for (const key of Reflect.ownKeys(layer)) {
+      const desc = Object.getOwnPropertyDescriptor(layer, key);
+      if (!('value' in desc)) {
+        Object.defineProperty(proto, key, { get: desc.get, set: desc.set, enumerable: true, configurable: true });
+      } else if (typeof desc.value === 'function') {
+        Object.defineProperty(proto, key, { value: desc.value, writable: true, enumerable: true, configurable: true });
+      } else {
+        const value = desc.value;
+        const name = typeof key === 'symbol' ? '' : key;
+        Object.defineProperty(proto, key, {
+          get: _markNativeAs(function () { return value; }, 'function get ' + name + '() { [native code] }'),
+          set: undefined, enumerable: true, configurable: true,
+        });
+      }
+    }
+  }
+  for (const key of Reflect.ownKeys(nav)) delete nav[key];
+  Object.setPrototypeOf(nav, proto);
+  if (!Object.prototype.hasOwnProperty.call(proto, Symbol.toStringTag)) {
+    Object.defineProperty(proto, Symbol.toStringTag, { value: 'Navigator', configurable: true });
+  }
+})();
+
 (function _markBuiltinsNative() {
   var seen = new Set();
   function walk(ctor) {

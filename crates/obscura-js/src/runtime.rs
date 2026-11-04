@@ -9013,6 +9013,20 @@ mod tests {
     }
 
     #[test]
+    fn navigator_has_chromes_property_layout() {
+        let mut rt = setup_runtime("<body></body>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const before = navigator.platform;
+            Object.defineProperty(Navigator.prototype, 'platform', { get: () => 'MacIntel', configurable: true });
+            return [Object.getOwnPropertyNames(navigator).length,
+                    Object.getPrototypeOf(navigator) === Navigator.prototype,
+                    Object.prototype.toString.call(navigator),
+                    typeof Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent').get,
+                    typeof before, navigator.platform];
+        })()"#).unwrap(), serde_json::json!([0, true, "[object Navigator]", "function", "string", "MacIntel"]));
+    }
+
+    #[test]
     fn editing_command_detection_checks_receiver_and_converts_domstring() {
         let mut rt = setup_runtime("<body></body>");
         assert_eq!(rt.evaluate(r#"(() => {
