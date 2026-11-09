@@ -5554,8 +5554,20 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let (mut sock, _) = listener.accept().await.unwrap();
+            // Read the whole request before answering. Closing a socket with
+            // unread bytes makes Windows send a reset instead of a clean close,
+            // and the client then fails with WSAECONNABORTED (10053) before it
+            // has read the response.
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
             let mut header = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
             if with_content_length {
                 header.push_str(&format!("Content-Length: {body_len}\r\n"));

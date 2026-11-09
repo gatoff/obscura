@@ -15672,6 +15672,13 @@ mod tests {
                 new Promise(resolve => {
                     const records = [];
                     const target = document.getElementById("target");
+                    // Each step waits for the previous delivery rather than a
+                    // timer: on Windows, timers fire in ~15.6ms steps and a
+                    // fixed schedule could check before the last delivery.
+                    // Two more frames after the last step catch extra entries.
+                    const steps = [() => window.scrollTo(0, 100), () => window.scrollTo(0, 260)];
+                    const settle = () => requestAnimationFrame(() =>
+                        requestAnimationFrame(() => resolve(records)));
                     const observer = new IntersectionObserver(entries => {
                         for (const entry of entries) {
                             records.push([
@@ -15681,11 +15688,12 @@ mod tests {
                                 Math.round(entry.intersectionRect.height),
                             ]);
                         }
+                        const next = steps.shift();
+                        if (next) setTimeout(next, 0); else settle();
                     }, { threshold: [0, 0.5, 1] });
                     observer.observe(target);
-                    setTimeout(() => window.scrollTo(0, 100), 25);
-                    setTimeout(() => window.scrollTo(0, 260), 50);
-                    setTimeout(() => resolve(records), 80);
+                    // Backstop only: a missing delivery fails with the records so far.
+                    setTimeout(() => resolve(records), 5000);
                 })
                 "#,
                 true,
@@ -15911,10 +15919,19 @@ mod tests {
                                 entry.intersectionRect.width, entry.intersectionRect.height,
                             ],
                         })));
+                        const next = steps.shift();
+                        if (next) setTimeout(next, 0); else settle();
                     }, { root, threshold: [0, 1] });
+                    // Each step waits for the previous delivery rather than a
+                    // timer: on Windows, timers fire in ~15.6ms steps and a
+                    // fixed schedule could check before the last delivery.
+                    // Two more frames after the last step catch extra entries.
+                    const steps = [() => { root.scrollTop = 999; }];
+                    const settle = () => requestAnimationFrame(() =>
+                        requestAnimationFrame(() => resolve(records)));
                     observer.observe(document.getElementById("target"));
-                    setTimeout(() => { root.scrollTop = 999; }, 25);
-                    setTimeout(() => resolve(records), 60);
+                    // Backstop only: a missing delivery fails with the records so far.
+                    setTimeout(() => resolve(records), 5000);
                 })
                 "#,
                 true,
@@ -15977,13 +15994,22 @@ mod tests {
                                 entry.intersectionRect.height,
                             ],
                         ]));
+                        const next = steps.shift();
+                        if (next) setTimeout(next, 0); else settle();
                     }, {
                         root: document.getElementById("root"),
                         threshold: [0, 1],
                     });
+                    // Each step waits for the previous delivery rather than a
+                    // timer: on Windows, timers fire in ~15.6ms steps and a
+                    // fixed schedule could check before the last delivery.
+                    // Two more frames after the last step catch extra entries.
+                    const steps = [() => { clip.scrollTop = 999; }];
+                    const settle = () => requestAnimationFrame(() =>
+                        requestAnimationFrame(() => resolve(records)));
                     observer.observe(document.getElementById("target"));
-                    setTimeout(() => { clip.scrollTop = 999; }, 25);
-                    setTimeout(() => resolve(records), 60);
+                    // Backstop only: a missing delivery fails with the records so far.
+                    setTimeout(() => resolve(records), 5000);
                 })
                 "#,
                 true,
