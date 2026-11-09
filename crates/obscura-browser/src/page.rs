@@ -87,6 +87,29 @@ fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// What an ES module has left of its active-work allowance once its graph is
+/// prepared. Graph loading and evaluation share one allowance, so the graph's
+/// time comes off it: evaluation never starts from a fresh budget. `None` means
+/// the graph used all of it.
+fn module_remaining_active_ms(module_budget_ms: u64, graph_elapsed_ms: u64) -> Option<u64> {
+    let remaining = module_budget_ms.saturating_sub(graph_elapsed_ms);
+    (remaining != 0).then_some(remaining)
+}
+
+/// The ceiling handed to a module's evaluation: its remaining active time plus
+/// the host-call grace, never past what is left of the page-wide script
+/// deadline. `None` means there is no time left to evaluate in.
+fn module_evaluation_budget_ms(
+    remaining_active_ms: u64,
+    hostcall_grace_ms: u64,
+    remaining_page_ms: u64,
+) -> Option<u64> {
+    let budget = remaining_active_ms
+        .saturating_add(hostcall_grace_ms)
+        .min(remaining_page_ms);
+    (budget != 0).then_some(budget)
+}
+
 #[cfg(feature = "render")]
 fn remaining_settle_resource_warmup_ms(
     max_ms: u64,
@@ -2661,10 +2684,11 @@ impl Page {
         };
         let evaluation_budget_ms = |remaining_active_ms: u64| -> Option<u64> {
             let remaining_page_ms = remaining_budget_ms(script_deadline)?;
-            let budget = remaining_active_ms
-                .saturating_add(module_hostcall_grace_ms)
-                .min(remaining_page_ms);
-            (budget != 0).then_some(budget)
+            module_evaluation_budget_ms(
+                remaining_active_ms,
+                module_hostcall_grace_ms,
+                remaining_page_ms,
+            )
         };
 
         let execute_classic =
@@ -2830,8 +2854,9 @@ impl Page {
                         }
                     };
                     let graph_elapsed_ms = elapsed_ms_ceil(prepare_started.elapsed());
-                    let remaining_active_ms = module_budget_ms.saturating_sub(graph_elapsed_ms);
-                    if remaining_active_ms == 0 {
+                    let Some(remaining_active_ms) =
+                        module_remaining_active_ms(module_budget_ms, graph_elapsed_ms)
+                    else {
                         tracing::warn!(
                             module = module_url.as_deref().unwrap_or("<inline>"),
                             graph_elapsed_ms,
@@ -2839,7 +2864,7 @@ impl Page {
                             "ES module exhausted its active budget during graph preparation",
                         );
                         continue;
-                    }
+                    };
                     let scheduled = ScheduledScript::Module {
                         prepared,
                         url: module_url,
@@ -5097,6 +5122,7 @@ mod tests {
         stylesheet_graph_is_origin_clean, truncate_on_char_boundary, url_matches_cdp_pattern,
         LoadedStylesheet, PendingFrameWork, StylesheetImport, DEFAULT_NAVIGATION_CHAIN_LIMIT,
     };
+    use super::{module_evaluation_budget_ms, module_remaining_active_ms};
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
@@ -8092,70 +8118,64 @@ mod tests {
         page
     }
 
+    // Graph loading and evaluation share one allowance, checked without a clock.
+    // This used to be one wall-clock test (a 100ms import, a 300ms loop, a 350ms
+    // budget) whose 50ms margin a busy CI runner could overrun. The arithmetic
+    // and the termination are now tested apart, so neither depends on timing.
+    #[test]
+    fn module_graph_and_evaluation_share_one_active_budget() {
+        // A 100ms graph leaves 250ms of a 350ms allowance: a 300ms script fits
+        // a fresh budget but not the shared one.
+        assert_eq!(module_remaining_active_ms(350, 100), Some(250));
+        assert_eq!(module_evaluation_budget_ms(250, 0, 30_000), Some(250));
+        // A graph that uses the whole allowance leaves nothing to evaluate.
+        assert_eq!(module_remaining_active_ms(350, 350), None);
+        assert_eq!(module_remaining_active_ms(350, 400), None);
+        // The host-call grace is added on top of the remaining active time,
+        assert_eq!(module_evaluation_budget_ms(250, 5_000, 30_000), Some(5_250));
+        // but the page-wide deadline still caps it,
+        assert_eq!(module_evaluation_budget_ms(250, 5_000, 1_000), Some(1_000));
+        assert_eq!(module_evaluation_budget_ms(250, 0, 100), Some(100));
+        // and a spent page deadline leaves no evaluation budget.
+        assert_eq!(module_evaluation_budget_ms(250, 5_000, 0), None);
+        assert_eq!(module_evaluation_budget_ms(u64::MAX, u64::MAX, 7), Some(7));
+    }
+
+    // The evaluation ceiling actually stops the module. The script never ends,
+    // so how long the runner takes to stop it can't change the outcome.
     #[tokio::test(flavor = "current_thread")]
-    async fn module_graph_and_evaluation_share_one_active_budget() {
-        use std::io::{Read as _, Write as _};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (request_tx, request_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 2048];
-            let length = stream.read(&mut request).unwrap();
-            let path = String::from_utf8_lossy(&request[..length])
-                .lines()
-                .next()
-                .and_then(|line| line.split_ascii_whitespace().nth(1))
-                .unwrap_or("/")
-                .to_string();
-            request_tx.send(path).unwrap();
-
-            // Spend part of the module's allowance loading its graph. The
-            // synchronous top-level work then fits in a freshly reset budget,
-            // but cannot fit in the shared active load+evaluation budget.
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let body = "export const delayed = true;";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len(),
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-
-        let base = format!("http://{address}");
+    async fn module_evaluation_is_terminated_at_its_budget() {
         let mut page = import_map_test_page(
-            "shared-module-budget",
-            &base,
+            "module-budget-terminates",
+            "http://127.0.0.1:9",
             r#"<html><head><script type="module">
-                import "./delayed.js";
-                globalThis.__shared_deadline_started = true;
-                const until = Date.now() + 300;
-                while (Date.now() < until) {}
-                globalThis.__shared_deadline_completed = true;
+                globalThis.__module_started = true;
+                while (true) {}
+                globalThis.__module_completed = true;
             </script></head><body></body></html>"#,
         );
-        page.execute_scripts_with_module_budget(Some(350)).await;
-
-        assert_eq!(
-            request_rx
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .unwrap(),
-            "/app/delayed.js",
+        let started = std::time::Instant::now();
+        page.execute_scripts_with_module_budget(Some(100)).await;
+        // The page-wide watchdog (31s by default) would also stop the loop; the
+        // bound is 100x the module budget, so only a missing module ceiling fails it.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the module's own budget, not the page-wide watchdog, must stop it",
         );
+
         let state = page
             .js
             .as_mut()
             .unwrap()
             .evaluate(
-                "[globalThis.__shared_deadline_started === true, \
-                  globalThis.__shared_deadline_completed === true]",
+                "[globalThis.__module_started === true, \
+                  globalThis.__module_completed === true]",
             )
             .unwrap();
         assert_eq!(
             state,
             serde_json::json!([true, false]),
-            "evaluation must be terminated at the remaining shared deadline",
+            "a module that overruns its evaluation budget must be terminated",
         );
     }
 
