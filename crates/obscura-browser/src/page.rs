@@ -8179,6 +8179,74 @@ mod tests {
         );
     }
 
+    // End to end, the graph's time really comes off the evaluation budget: the
+    // call site must hand evaluation what the graph left, not a fresh allowance.
+    // The two tests above can't see that wiring. Every margin here points the
+    // safe way: the server's sleep guarantees the graph took at least 1,000ms
+    // of the 2,000ms allowance, so evaluation gets at most 1,000ms; a fresh
+    // budget would run the loop for the full 2,000ms, because termination can
+    // come late but never early. The 1,600ms threshold leaves 600ms for late
+    // termination, ten times the margin the old wall-clock test had.
+    #[tokio::test(flavor = "current_thread")]
+    async fn module_evaluation_gets_only_what_the_graph_left() {
+        use std::io::{Read as _, Write as _};
+
+        const BUDGET_MS: u64 = 2_000;
+        const GRAPH_MS: u64 = 1_000;
+        const FRESH_BUDGET_FLOOR_MS: f64 = 1_600.0;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(GRAPH_MS));
+            let body = "export const delayed = true;";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let mut page = import_map_test_page(
+            "module-budget-shared",
+            &format!("http://{address}"),
+            r#"<html><head><script type="module">
+                import "./delayed.js";
+                globalThis.__eval_started = Date.now();
+                globalThis.__eval_last = globalThis.__eval_started;
+                while (true) { globalThis.__eval_last = Date.now(); }
+            </script></head><body></body></html>"#,
+        );
+        page.execute_scripts_with_module_budget(Some(BUDGET_MS)).await;
+
+        let ran = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "typeof globalThis.__eval_started === 'number' \
+                  ? globalThis.__eval_last - globalThis.__eval_started : null",
+            )
+            .unwrap();
+        let ran_ms = ran
+            .as_f64()
+            .expect("the module must evaluate: the graph leaves about 1,000ms of its allowance");
+        assert!(
+            ran_ms < FRESH_BUDGET_FLOOR_MS,
+            "evaluation ran {ran_ms}ms: it got a fresh {BUDGET_MS}ms budget instead of what the \
+             {GRAPH_MS}ms graph left",
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn queued_module_does_not_spend_its_budget_waiting_for_deferred_script() {
         use std::io::{Read as _, Write as _};
