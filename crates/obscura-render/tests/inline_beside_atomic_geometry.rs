@@ -36,3 +36,34 @@ fn nested_inlines_beside_an_atomic_inline_resolve_inside_out() {
     assert!(inner.width > 0.0 && outer.width > inner.width, "{outer:?} {inner:?}");
     assert!(outer.x <= inner.x && outer.x + outer.width >= inner.x + inner.width - 0.5);
 }
+
+/// The box of an inline element is as tall as its font, not its line: with a
+/// 24px line, a link beside an input used to be reported 24px tall from the
+/// top of the line, where Chrome (and this engine, for a link with no atomic
+/// neighbour) reports the font's ascent plus descent, centred in the line.
+#[test]
+fn inline_link_beside_an_atomic_inline_is_as_tall_as_its_font() {
+    let page = |sibling: &str| {
+        format!(
+            "<!doctype html><body style='margin:0;font:16px/24px sans-serif'>\
+             <div><a id=t href=#>Try</a>{sibling}</div>"
+        )
+    };
+    let rect = |html: &str| {
+        let tree = parse_html(html);
+        let laid = layout_dom(&tree, (800.0, 600.0));
+        laid.rects[&tree.get_element_by_id("t").expect("t")]
+    };
+    let alone = rect(&page(""));
+    assert!(alone.height < 20.0 && alone.y > 2.0, "ordinary inline: {alone:?}");
+    for sibling in [
+        "<input style='height:24px;box-sizing:border-box;vertical-align:middle'>",
+        "<button style='height:24px;box-sizing:border-box;vertical-align:middle'>b</button>",
+    ] {
+        let beside = rect(&page(sibling));
+        assert!(
+            (beside.height - alone.height).abs() <= 0.5 && (beside.y - alone.y).abs() <= 0.5,
+            "{sibling}: beside an atomic inline {beside:?}, alone {alone:?}"
+        );
+    }
+}

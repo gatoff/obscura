@@ -7705,7 +7705,7 @@ fn layout_dom_once(
         }
     }
     if let Some(root_id) = root {
-        synthesize_missing_inline_rects(tree, root_id, &mut rects, &styles, &text_runs, &mut inline_fragments);
+        synthesize_missing_inline_rects(tree, root_id, &mut rects, &styles, &text_runs, &mut inline_fragments, &engine);
     }
     sync_positioned_pseudo_percentage_padding(&rects, &mut styles);
 
@@ -7930,6 +7930,12 @@ fn layout_dom_once(
 /// the element as invisible. Derive each such element's border-box fragments
 /// from the text runs and boxes it contains, one fragment per line, and their
 /// union as its bounding rect. Nested inlines are resolved before their parents.
+///
+/// A word leaf is as tall as its line, which is what advances the line; the
+/// element's box is only as tall as its font (ascent plus descent), centred
+/// in that line, exactly as `synthesize_ordinary_inline_fragments` makes it
+/// for an inline with no atomic neighbour. So each text run gives up its
+/// leading before it joins the fragment.
 fn synthesize_missing_inline_rects(
     tree: &DomTree,
     root: NodeId,
@@ -7937,6 +7943,7 @@ fn synthesize_missing_inline_rects(
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     text_runs: &HashMap<NodeId, Vec<(Rect, String)>>,
     inline_fragments: &mut HashMap<NodeId, Vec<Rect>>,
+    engine: &crate::inline::TextEngine,
 ) {
     fn needs_rect(id: NodeId, rects: &HashMap<NodeId, Rect>, styles: &HashMap<NodeId, crate::LayoutStyle>) -> bool {
         styles.get(&id).is_some_and(|style| {
@@ -7951,6 +7958,7 @@ fn synthesize_missing_inline_rects(
         fragments: &HashMap<NodeId, Vec<Rect>>,
         styles: &HashMap<NodeId, crate::LayoutStyle>,
         text_runs: &HashMap<NodeId, Vec<(Rect, String)>>,
+        engine: &crate::inline::TextEngine,
         out: &mut Vec<Rect>,
         depth: usize,
     ) -> bool {
@@ -7969,14 +7977,31 @@ fn synthesize_missing_inline_rects(
                 return false;
             }
             if let Some(runs) = text_runs.get(&child) {
-                out.extend(runs.iter().map(|(rect, _)| *rect).filter(|r| r.width > 0.0 || r.height > 0.0));
+                // The text is set in this element's font; without a style
+                // for it there is no font box to cut the run down to.
+                let font_height = styles
+                    .get(&id)
+                    .map(|style| engine.inline_font_box_height(style).max(0.0));
+                out.extend(
+                    runs.iter()
+                        .map(|(rect, _)| *rect)
+                        .filter(|r| r.width > 0.0 || r.height > 0.0)
+                        .map(|run| match font_height {
+                            Some(height) if height < run.height => Rect {
+                                y: run.y + (run.height - height) / 2.0,
+                                height,
+                                ..run
+                            },
+                            _ => run,
+                        }),
+                );
             } else if let Some(pieces) = fragments.get(&child) {
                 out.extend(pieces.iter().copied());
             } else if let Some(rect) = rects.get(&child) {
                 if styles.get(&child).is_some_and(|s| s.display != crate::Display::None) {
                     out.push(*rect);
                 }
-            } else if !collect(tree, child, rects, fragments, styles, text_runs, out, depth + 1) {
+            } else if !collect(tree, child, rects, fragments, styles, text_runs, engine, out, depth + 1) {
                 return false;
             }
         }
@@ -7999,7 +8024,7 @@ fn synthesize_missing_inline_rects(
     }
     for id in order {
         let mut pieces = Vec::new();
-        if !collect(tree, id, rects, inline_fragments, styles, text_runs, &mut pieces, 0) {
+        if !collect(tree, id, rects, inline_fragments, styles, text_runs, engine, &mut pieces, 0) {
             continue;
         }
         if pieces.is_empty() {
