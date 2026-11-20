@@ -765,3 +765,66 @@ async fn radio_release_selects_only_the_target_in_its_group() {
         "the newly selected radio alone receives activation events"
     );
 }
+
+/// The Input handlers keep the hovered element and the pressed button on
+/// `globalThis`, and focus() keeps the focused element there. Those names must
+/// be in the bootstrap hide list like every other internal: after one click
+/// into a field and one key, a page listing its window's own properties used
+/// to find `__obscura_hover_target`, `__obscura_mouse_down`,
+/// `__obscura_mouse_over_target` and `__obscura_focused` there.
+#[tokio::test(flavor = "current_thread")]
+async fn input_leaves_no_internal_names_on_window() {
+    let (mut ctx, sid) = setup().await;
+    let before = evaluate(&mut ctx, 2, "Object.getOwnPropertyNames(window).length", &sid).await;
+    for (id, kind) in [(3, "mouseMoved"), (4, "mousePressed"), (5, "mouseReleased")] {
+        cdp(
+            &mut ctx,
+            id,
+            "Input.dispatchMouseEvent",
+            // Inside #stack-input, so the click also focuses a field.
+            json!({"type": kind, "x": 700.0, "y": 40.0, "button": "left", "clickCount": 1}),
+            &sid,
+        )
+        .await;
+    }
+    for (id, kind) in [(7, "keyDown"), (8, "keyUp")] {
+        cdp(
+            &mut ctx,
+            id,
+            "Input.dispatchKeyEvent",
+            json!({"type": kind, "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65, "text": "a"}),
+            &sid,
+        )
+        .await;
+    }
+    let typed = evaluate(&mut ctx, 9, "document.getElementById('stack-input').value", &sid).await;
+    assert_eq!(typed["result"]["value"], "a", "the click did not focus the field");
+    let seen = evaluate(
+        &mut ctx,
+        10,
+        r#"JSON.stringify((() => {
+            const leaked = name => /obscura/i.test(String(name));
+            const inLoop = [];
+            for (const key in window) if (leaked(key)) inLoop.push(key);
+            return {
+                keys: Object.keys(window).filter(leaked),
+                names: Object.getOwnPropertyNames(window).filter(leaked),
+                own: Reflect.ownKeys(window).filter(leaked),
+                descriptors: Object.keys(Object.getOwnPropertyDescriptors(window)).filter(leaked),
+                inLoop,
+                count: Object.getOwnPropertyNames(window).length,
+            };
+        })())"#,
+        &sid,
+    )
+    .await;
+    let seen: Value = serde_json::from_str(seen["result"]["value"].as_str().unwrap()).unwrap();
+    for surface in ["keys", "names", "own", "descriptors", "inLoop"] {
+        assert_eq!(seen[surface], json!([]), "{surface} lists an internal name");
+    }
+    assert_eq!(
+        seen["count"].as_f64(),
+        before["result"]["value"].as_f64(),
+        "input changed how many properties the window reports"
+    );
+}

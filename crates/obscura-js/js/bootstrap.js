@@ -25,12 +25,19 @@ const __obscuraCore = globalThis.Deno.core;
     // Created by later evaluation, input and emulation paths. Register them
     // before the snapshot hide list is captured, just like the other internals.
     '__obscura_await_rejected', '__obscura_click_target',
+    // First set at run time: by the CDP Input handlers on a mouse move and
+    // press, and by focus() when an element takes focus.
+    '__obscura_hover_target', '__obscura_mouse_down', '__obscura_mouse_over_target',
+    '__obscura_focused',
     '__obscura_screen_emulated', '__obscura_screen_w', '__obscura_screen_h',
     '__obscura_viewport_w', '__obscura_viewport_h',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
+    // Frozen (non-configurable) further down, so it has to be registered
+    // here first: once frozen it can no longer be made non-enumerable.
+    '__obscura_activateSummary',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
     '__obscura_inputChecked', '__obscura_setInputChecked',
     '__obscura_inputIndeterminate', '__obscura_setInputIndeterminate',
