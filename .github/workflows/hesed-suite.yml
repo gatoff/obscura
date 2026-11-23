@@ -5,6 +5,8 @@
 #
 #   hesed suite ok (rust <toolchain>, features <features>)
 #
+# The name is the claim; the status's state (success or failure) says whether it held.
+#
 # hesed-agent's CI refuses a pin without a green status of the exact name it expects, so a run with
 # another toolchain or feature set never stands in for the one it needs. A status rather than a check
 # run because a status can be set on any commit, including one that predates this file.
@@ -21,7 +23,8 @@ on:
   pull_request:
     branches: [hesed/main]
   # Weekly on the tip, to hear early when a new runner image breaks the suite. Schedules run only on the
-  # repository's default branch, which for this fork is hesed/main. Mondays 06:00 UTC.
+  # repository's default branch, which for this fork is hesed/main. Mondays 06:00 UTC, so a broken image
+  # shows before the week's work; any quiet hour would do.
   schedule:
     - cron: "0 6 * * 1"
   # By hand, on any commit: how a pinned commit, or a toolchain bump in hesed-agent, gets its status
@@ -54,13 +57,13 @@ env:
   # turns it on), comma-separated as cargo takes them. Part of the status name, for the same reason.
   FEATURES: render
   CARGO_TERM_COLOR: always
-  # Incremental state only helps repeated local edits; leaving it out keeps the cache small.
+  # Incremental build state only helps repeated local edits, and would only make the cache bigger.
   CARGO_INCREMENTAL: 0
 
 jobs:
   # What this run tests: the commit, the toolchain, and the status name they make.
   target:
-    name: target
+    name: what to test
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -98,9 +101,9 @@ jobs:
         # Floating images, as in hesed-agent's ci.yml: the weekly run is there to notice when one moves.
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # Windows took 48 minutes warm in hesed-agent's CI; a cold run builds V8's bindings and the workspace
-    # in release.
-    timeout-minutes: 120
+    # The first runs, with no cache, took 24 minutes on Windows (the slowest); 60 leaves room for a cold
+    # cache after a toolchain change without letting a hung test hold a runner for hours.
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
