@@ -1,0 +1,169 @@
+# The hesed agent's run of this fork's suite (ADR-019 and INFRA_fork-ci in hesed-agent). hesed-agent
+# pins a commit of hesed/main and builds it from source; this workflow is what shows a commit is fit to
+# pin. It runs the whole workspace suite in the configuration hesed-agent builds the fork in, on the three
+# OSes the agent ships on, and records the result as a commit status named for what it tested:
+#
+#   hesed suite ok (rust <toolchain>, features <features>)
+#
+# hesed-agent's CI refuses a pin without a green status of the exact name it expects, so a run with
+# another toolchain or feature set never stands in for the one it needs. A status rather than a check
+# run because a status can be set on any commit, including one that predates this file.
+#
+# Upstream's workflows (ci.yml, release.yml, docker.yml) are left as they are: they fire on PRs to
+# `main` and on `v*` tags, never on hesed/main. Being a file of our own, this one never conflicts when
+# upstream is merged in. The suite command matches `cargo xtask obscura-suite` in hesed-agent
+# (xtask/src/obscura.rs); change the two together.
+name: hesed suite
+
+on:
+  push:
+    branches: [hesed/main]
+  pull_request:
+    branches: [hesed/main]
+  # Weekly on the tip, to hear early when a new runner image breaks the suite. Schedules run only on the
+  # repository's default branch, which for this fork is hesed/main. Mondays 06:00 UTC.
+  schedule:
+    - cron: "0 6 * * 1"
+  # By hand, on any commit: how a pinned commit, or a toolchain bump in hesed-agent, gets its status
+  # without a new fork commit.
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full commit hash to test (empty for the tip of the branch the run is started on)
+        required: false
+        default: ""
+      toolchain:
+        description: Rust toolchain, x.y.z (empty for hesed-agent's pin below)
+        required: false
+        default: ""
+
+# Read-only; only the status job may write, and only commit statuses.
+permissions:
+  contents: read
+
+# A newer push to the same PR cancels the older run. Every other run is keyed by what it tests.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}-{1}', inputs.commit || github.sha, inputs.toolchain) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # hesed-agent's rust-toolchain.toml channel. Keep in step with it: if they differ, the status this
+  # writes has a name hesed-agent's gate doesn't accept, so a mismatch fails there rather than passing.
+  HESED_TOOLCHAIN: "1.97.0"
+  # The fork features hesed-agent's engine enables (`render`, plus `stealth` once FEAT_obscura-persona
+  # turns it on), comma-separated as cargo takes them. Part of the status name, for the same reason.
+  FEATURES: render
+  CARGO_TERM_COLOR: always
+  # Incremental state only helps repeated local edits; leaving it out keeps the cache small.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # What this run tests: the commit, the toolchain, and the status name they make.
+  target:
+    name: target
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.t.outputs.sha }}
+      toolchain: ${{ steps.t.outputs.toolchain }}
+      context: ${{ steps.t.outputs.context }}
+    steps:
+      - id: t
+        shell: bash
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+          INPUT_TOOLCHAIN: ${{ inputs.toolchain }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          SHA: ${{ github.sha }}
+        run: |
+          # A PR's own head, not the merge with hesed/main that a pull_request run would otherwise test:
+          # the head is the commit that may be pinned.
+          sha=${INPUT_COMMIT:-${PR_HEAD:-$SHA}}
+          toolchain=${INPUT_TOOLCHAIN:-$HESED_TOOLCHAIN}
+          # Both end up in a status name and a checkout, so only these shapes are accepted.
+          [[ $sha =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit must be a full 40-character hash, got '$sha'"; exit 1; }
+          [[ $toolchain =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::toolchain must be x.y.z, got '$toolchain'"; exit 1; }
+          context="hesed suite ok (rust $toolchain, features $FEATURES)"
+          echo "testing $sha: $context"
+          { echo "sha=$sha"; echo "toolchain=$toolchain"; echo "context=$context"; } >> "$GITHUB_OUTPUT"
+
+  # The suite on each OS, as hesed-agent's `obscura suite` job ran it.
+  suite:
+    name: suite (${{ matrix.os }})
+    needs: target
+    strategy:
+      # Every OS to the end, so a run shows all its platform failures at once.
+      fail-fast: false
+      matrix:
+        # Floating images, as in hesed-agent's ci.yml: the weekly run is there to notice when one moves.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Windows took 48 minutes warm in hesed-agent's CI; a cold run builds V8's bindings and the workspace
+    # in release.
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTUP_TOOLCHAIN: ${{ needs.target.outputs.toolchain }}
+    steps:
+      # actions/checkout v7.0.1, the pin hesed-agent's workflows use.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.target.outputs.sha }}
+          # No step pushes, so the token isn't left in .git/config for the build to see.
+          persist-credentials: false
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustc -vV
+          case "$(rustc -V)" in "rustc $RUSTUP_TOOLCHAIN "*) ;; *) echo "active rustc is not $RUSTUP_TOOLCHAIN"; exit 1 ;; esac
+      # One process per test, which the V8 tests need. taiki-e/install-action v2, the pin upstream's CI
+      # and hesed-agent's use; it downloads nextest's signed release binary.
+      - uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d
+        with:
+          tool: nextest
+          fallback: none
+      # Swatinem/rust-cache v2.9.3, hesed-agent's pin. Keyed by toolchain so a by-hand run with another
+      # one doesn't restore incompatible build output. Saved only from pushes and the weekly run, never
+      # from a PR, whose build scripts nobody here has reviewed yet.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: hesed-suite-${{ needs.target.outputs.toolchain }}
+          save-if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
+      - name: cargo nextest run
+        run: |
+          # obscura-net's certificate tests point rustls at a private CA through SSL_CERT_DIR; an
+          # inherited SSL_CERT_FILE overrides it.
+          unset SSL_CERT_FILE SSL_CERT_DIR
+          # Release, as upstream's CI runs it: some tests have wall-clock budgets sized for optimized code,
+          # and release has no debug info, which keeps the output to about 5 GB rather than 20.
+          cargo nextest run --release --locked --no-fail-fast --workspace --features "$FEATURES"
+
+  # The result, as the commit status hesed-agent's gate reads. Not on the weekly run: that one tests the
+  # runner images, and a red result there shouldn't take away a commit's earlier green status. Not on a
+  # PR from another repository either, whose token can't write. Not when the run was cancelled.
+  status:
+    name: status
+    needs: [target, suite]
+    if: >-
+      !cancelled() && needs.target.result == 'success' && github.event_name != 'schedule' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.target.outputs.sha }}
+          CONTEXT: ${{ needs.target.outputs.context }}
+          RESULT: ${{ needs.suite.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$RESULT" = success ]; then state=success; desc="passed on Linux, macOS and Windows"
+          else state=failure; desc="suite $RESULT"; fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state="$state" -f context="$CONTEXT" -f description="$desc" -f target_url="$RUN_URL" \
+            --jq '"\(.state): \(.context) on \(.url | split("/") | last)"'
